@@ -49,7 +49,7 @@ const uploadLimiter = rateLimit({
 
 const adminLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  limit: 30,
+  limit: 60,
   standardHeaders: "draft-7",
   legacyHeaders: false
 });
@@ -89,6 +89,7 @@ function requireAdmin(req, res, next) {
   try {
     decoded = Buffer.from(header.slice(6), "base64").toString("utf8");
   } catch {
+    res.set("WWW-Authenticate", 'Basic realm="Image Storage Admin"');
     return res.status(401).send("Invalid credentials");
   }
 
@@ -149,10 +150,12 @@ const upload = multer({
   }
 });
 
+// Home
 app.get("/", (req, res) => {
   res.send("Image URL Storage Server is running.");
 });
 
+// Health check
 app.get("/health", (req, res) => {
   res.json({
     success: true,
@@ -160,7 +163,7 @@ app.get("/health", (req, res) => {
   });
 });
 
-// Upload image API
+// Public upload API - API KEY required
 app.post(
   "/api/upload",
   uploadLimiter,
@@ -174,26 +177,21 @@ app.post(
       });
     }
 
-    const imageUrl = `${BASE_URL}/uploads/${encodeURIComponent(req.file.filename)}`;
-
     res.json({
       success: true,
       message: "Image uploaded successfully",
       filename: req.file.filename,
-      url: imageUrl,
+      url: `${BASE_URL}/uploads/${encodeURIComponent(req.file.filename)}`,
       size: req.file.size
     });
   }
 );
 
-// List images API
+// Public image list API - API KEY required
 app.get("/api/images", requireApiKey, (req, res) => {
   try {
-    const files = fs.readdirSync(STORAGE_DIR)
-      .filter(name => {
-        const fullPath = path.join(STORAGE_DIR, name);
-        return fs.statSync(fullPath).isFile();
-      })
+    const images = fs.readdirSync(STORAGE_DIR)
+      .filter(name => fs.statSync(path.join(STORAGE_DIR, name)).isFile())
       .map(name => {
         const fullPath = path.join(STORAGE_DIR, name);
         const stats = fs.statSync(fullPath);
@@ -209,10 +207,12 @@ app.get("/api/images", requireApiKey, (req, res) => {
 
     res.json({
       success: true,
-      count: files.length,
-      images: files
+      count: images.length,
+      images
     });
   } catch (error) {
+    console.error(error);
+
     res.status(500).json({
       success: false,
       error: "Could not read image directory"
@@ -220,7 +220,7 @@ app.get("/api/images", requireApiKey, (req, res) => {
   }
 });
 
-// Delete image API
+// Public delete API - API KEY required
 app.delete("/api/images/:filename", requireApiKey, (req, res) => {
   const filename = path.basename(req.params.filename);
   const filePath = path.join(STORAGE_DIR, filename);
@@ -240,12 +240,105 @@ app.delete("/api/images/:filename", requireApiKey, (req, res) => {
       message: "Image deleted successfully"
     });
   } catch (error) {
+    console.error(error);
+
     res.status(500).json({
       success: false,
       error: "Could not delete image"
     });
   }
 });
+
+// Admin upload API - uses admin authentication, not API KEY
+app.post(
+  "/admin/api/upload",
+  adminLimiter,
+  requireAdmin,
+  upload.single("image"),
+  (req, res) => {
+    if (!req.file) {
+      return res.status(400).json({
+        success: false,
+        error: "No image file received"
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Image uploaded successfully",
+      filename: req.file.filename,
+      url: `${BASE_URL}/uploads/${encodeURIComponent(req.file.filename)}`,
+      size: req.file.size
+    });
+  }
+);
+
+// Admin image list API
+app.get("/admin/api/images", adminLimiter, requireAdmin, (req, res) => {
+  try {
+    const images = fs.readdirSync(STORAGE_DIR)
+      .filter(name => fs.statSync(path.join(STORAGE_DIR, name)).isFile())
+      .map(name => {
+        const fullPath = path.join(STORAGE_DIR, name);
+        const stats = fs.statSync(fullPath);
+
+        return {
+          filename: name,
+          url: `${BASE_URL}/uploads/${encodeURIComponent(name)}`,
+          size: stats.size,
+          uploadedAt: stats.mtime
+        };
+      })
+      .sort((a, b) => new Date(b.uploadedAt) - new Date(a.uploadedAt));
+
+    res.json({
+      success: true,
+      count: images.length,
+      images
+    });
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).json({
+      success: false,
+      error: "Could not load images"
+    });
+  }
+});
+
+// Admin delete API
+app.delete(
+  "/admin/api/images/:filename",
+  adminLimiter,
+  requireAdmin,
+  (req, res) => {
+    const filename = path.basename(req.params.filename);
+    const filePath = path.join(STORAGE_DIR, filename);
+
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({
+        success: false,
+        error: "Image not found"
+      });
+    }
+
+    try {
+      fs.unlinkSync(filePath);
+
+      res.json({
+        success: true,
+        message: "Image deleted successfully"
+      });
+    } catch (error) {
+      console.error(error);
+
+      res.status(500).json({
+        success: false,
+        error: "Could not delete image"
+      });
+    }
+  }
+);
 
 // Admin panel
 app.get("/admin", adminLimiter, requireAdmin, (req, res) => {
@@ -257,8 +350,10 @@ app.get("/admin", adminLimiter, requireAdmin, (req, res) => {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Image Storage Admin</title>
+
 <style>
 *{box-sizing:border-box}
+
 body{
   margin:0;
   padding:20px;
@@ -266,6 +361,7 @@ body{
   color:#fff;
   font-family:Arial,sans-serif
 }
+
 .container{
   max-width:750px;
   margin:30px auto;
@@ -273,7 +369,9 @@ body{
   padding:24px;
   border-radius:14px
 }
+
 h2{margin-top:0}
+
 input,button{
   width:100%;
   padding:13px;
@@ -282,14 +380,21 @@ input,button{
   border:0;
   font-size:15px
 }
-input{background:#fff;color:#111}
+
+input{
+  background:#fff;
+  color:#111
+}
+
 button{
   background:#16a36a;
   color:white;
   font-weight:bold;
   cursor:pointer
 }
+
 button:disabled{opacity:.6}
+
 .item{
   background:#27364a;
   padding:12px;
@@ -297,6 +402,7 @@ button:disabled{opacity:.6}
   border-radius:9px;
   overflow-wrap:anywhere
 }
+
 .item img{
   max-width:100%;
   max-height:180px;
@@ -304,12 +410,21 @@ button:disabled{opacity:.6}
   margin-bottom:10px;
   border-radius:7px
 }
+
 .delete{background:#d94343}
-#status{margin-top:15px;overflow-wrap:anywhere}
+
+#status{
+  margin-top:15px;
+  overflow-wrap:anywhere
+}
+
+a{color:#8bc7ff}
 </style>
 </head>
+
 <body>
 <div class="container">
+
 <h2>Image Storage Admin</h2>
 
 <form id="uploadForm">
@@ -319,7 +434,10 @@ button:disabled{opacity:.6}
     accept="image/jpeg,image/png,image/webp,image/gif"
     required
   >
-  <button type="submit" id="uploadButton">Upload Image</button>
+
+  <button type="submit" id="uploadButton">
+    Upload Image
+  </button>
 </form>
 
 <div id="status"></div>
@@ -328,6 +446,7 @@ button:disabled{opacity:.6}
 
 <h3>Uploaded Images</h3>
 <div id="imageList">Loading...</div>
+
 </div>
 
 <script>
@@ -337,6 +456,7 @@ const uploadButton = document.getElementById("uploadButton");
 const statusBox = document.getElementById("status");
 const imageList = document.getElementById("imageList");
 
+// Upload image
 form.addEventListener("submit", async function(event) {
   event.preventDefault();
 
@@ -354,9 +474,10 @@ form.addEventListener("submit", async function(event) {
   statusBox.textContent = "Uploading...";
 
   try {
-    const response = await fetch("/api/upload", {
+    const response = await fetch("/admin/api/upload", {
       method: "POST",
-      body: data
+      body: data,
+      credentials: "same-origin"
     });
 
     const result = await response.json();
@@ -365,7 +486,7 @@ form.addEventListener("submit", async function(event) {
       throw new Error(result.error || "Upload failed");
     }
 
-    statusBox.innerHTML = "";
+    statusBox.textContent = "";
 
     const message = document.createElement("p");
     message.textContent = "Upload successful!";
@@ -379,7 +500,7 @@ form.addEventListener("submit", async function(event) {
     statusBox.appendChild(link);
 
     fileInput.value = "";
-    loadImages();
+    await loadImages();
 
   } catch (error) {
     statusBox.textContent = "Error: " + error.message;
@@ -388,17 +509,21 @@ form.addEventListener("submit", async function(event) {
   }
 });
 
+// Load images
 async function loadImages() {
   imageList.textContent = "Loading...";
 
   try {
-    const response = await fetch("/api/images");
-
-    if (!response.ok) {
-      throw new Error("Could not load images");
-    }
+    const response = await fetch("/admin/api/images", {
+      credentials: "same-origin"
+    });
 
     const result = await response.json();
+
+    if (!response.ok || !result.success) {
+      throw new Error(result.error || "Could not load images");
+    }
+
     imageList.innerHTML = "";
 
     if (!result.images || result.images.length === 0) {
@@ -432,8 +557,11 @@ async function loadImages() {
 
         try {
           const response = await fetch(
-            "/api/images/" + encodeURIComponent(item.filename),
-            { method: "DELETE" }
+            "/admin/api/images/" + encodeURIComponent(item.filename),
+            {
+              method: "DELETE",
+              credentials: "same-origin"
+            }
           );
 
           const result = await response.json();
@@ -442,7 +570,8 @@ async function loadImages() {
             throw new Error(result.error || "Delete failed");
           }
 
-          loadImages();
+          await loadImages();
+
         } catch (error) {
           alert(error.message);
         }
@@ -457,12 +586,13 @@ async function loadImages() {
     });
 
   } catch (error) {
-    imageList.textContent = error.message;
+    imageList.textContent = "Could not load images: " + error.message;
   }
 }
 
 loadImages();
 </script>
+
 </body>
 </html>`);
 });
@@ -477,7 +607,7 @@ app.use((req, res) => {
 
 // Error handler
 app.use((err, req, res, next) => {
-  console.error(err);
+  console.error("Request error:", err);
 
   if (err instanceof multer.MulterError) {
     return res.status(400).json({
@@ -494,6 +624,8 @@ app.use((err, req, res, next) => {
   });
 });
 
+// Start server
 app.listen(PORT, () => {
   console.log(`Image Storage Server running on port ${PORT}`);
 });
+        
